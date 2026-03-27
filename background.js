@@ -115,14 +115,39 @@ async function reconcile(trigger) {
     }
 
     // 4. Detect local unpins vs URL changes within the same tab
+    //    Build a set of current origins for fallback matching (handles Chrome restart / legacy snapshot)
+    const currentOrigins = new Map(); // origin -> url (first match)
+    for (const [url] of currentLocalUrls) {
+      try {
+        const origin = new URL(url).origin;
+        if (!currentOrigins.has(origin)) currentOrigins.set(origin, url);
+      } catch {}
+    }
+    // Track which current URLs have been matched to a snapshot URL via origin fallback
+    const originMatchedUrls = new Set();
+
     for (const [snapshotUrl, snapshotTabId] of snapshotUrlToTabId) {
       if (currentLocalUrls.has(snapshotUrl)) continue; // URL still present, no change
 
-      // URL is gone — check if the tab still exists with a different URL
-      const newUrl = snapshotTabId != null ? currentTabIdToUrl.get(snapshotTabId) : null;
+      // URL is gone — first try matching by tab ID
+      let newUrl = snapshotTabId != null ? currentTabIdToUrl.get(snapshotTabId) : null;
+
+      // Fallback: match by origin (handles Chrome restart where tab IDs change,
+      // and legacy snapshots with no tab IDs). Only use each current URL once.
+      if (!newUrl) {
+        try {
+          const snapshotOrigin = new URL(snapshotUrl).origin;
+          const candidate = currentOrigins.get(snapshotOrigin);
+          if (candidate && !originMatchedUrls.has(candidate) && !currentLocalUrls.has(snapshotUrl)) {
+            newUrl = candidate;
+            originMatchedUrls.add(candidate);
+          }
+        } catch {}
+      }
 
       if (newUrl && newUrl !== snapshotUrl) {
-        // Same tab, URL changed (e.g., redirect after load). Update remote entry, preserve order.
+        // Same tab (or same origin), URL changed (e.g., redirect after load).
+        // Update remote entry, preserve order.
         console.log(LOG_PREFIX, 'URL changed in same tab:', snapshotUrl, '->', newUrl);
         if (remotePinned[snapshotUrl]) {
           const oldEntry = remotePinned[snapshotUrl];
@@ -131,7 +156,7 @@ async function reconcile(trigger) {
         }
         // Clean up any tombstone for the new URL
         delete tombstones[newUrl];
-      } else {
+      } else if (!newUrl) {
         // Tab is gone — this is a real unpin/close
         console.log(LOG_PREFIX, 'Detected local unpin:', snapshotUrl);
         tombstones[snapshotUrl] = { removedAt: now };
