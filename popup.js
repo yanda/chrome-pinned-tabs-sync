@@ -112,6 +112,14 @@ async function loadStatus() {
       tombstonesSection.style.display = 'none';
     }
   } catch (err) {
+    // Extension context can be invalidated after update/reload
+    if (err.message && err.message.includes('Extension context invalidated')) {
+      statusText.textContent = 'Extension updated — please reopen popup';
+      statusDot.className = 'dot stale';
+      syncBtn.disabled = true;
+      resetBtn.disabled = true;
+      return;
+    }
     statusText.textContent = 'Error loading status';
     statusDot.className = 'dot error';
     console.error('Popup error:', err);

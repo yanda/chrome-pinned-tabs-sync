@@ -8,6 +8,7 @@ const LOG_PREFIX = '[PinnedTabsSync]';
 // === State (in-memory, resets on worker restart) ===
 let isSyncing = false;
 let debounceTimer = null;
+let knownPinnedTabIds = new Set(); // Track pinned tab IDs to filter onTabRemoved noise
 
 // === URL Utilities ===
 
@@ -32,12 +33,72 @@ async function safeTabOp(operation, maxRetries = 3) {
     try {
       return await operation();
     } catch (err) {
-      if (err.message && err.message.includes('cannot be edited') && attempt < maxRetries) {
+      const msg = err.message || '';
+      // Non-retryable: tab no longer exists
+      if (msg.includes('No tab with id') || msg.includes('No current window')) {
+        console.warn(LOG_PREFIX, 'Tab/window gone, skipping:', msg);
+        return null;
+      }
+      // Retryable: tab is temporarily locked
+      if (msg.includes('cannot be edited') && attempt < maxRetries) {
         console.log(LOG_PREFIX, `Tab busy, retrying in ${(attempt + 1)}s...`);
         await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
         continue;
       }
       throw err;
+    }
+  }
+}
+
+// === Data Validation ===
+
+function isValidPinnedTabs(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return false;
+  for (const [url, entry] of Object.entries(obj)) {
+    if (typeof url !== 'string') return false;
+    if (typeof entry !== 'object' || entry === null) return false;
+    if (typeof entry.addedAt !== 'number') return false;
+    if (entry.order !== undefined && typeof entry.order !== 'number') return false;
+  }
+  return true;
+}
+
+function isValidTombstones(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return false;
+  for (const [url, entry] of Object.entries(obj)) {
+    if (typeof url !== 'string') return false;
+    if (typeof entry !== 'object' || entry === null) return false;
+    if (typeof entry.removedAt !== 'number') return false;
+  }
+  return true;
+}
+
+// === Storage Quota Protection ===
+
+const SYNC_QUOTA_BYTES_PER_ITEM = 8192;
+const SYNC_QUOTA_MAX_ITEMS = 512;
+
+function estimateJsonSize(obj) {
+  return new Blob([JSON.stringify(obj)]).size;
+}
+
+function enforceSyncQuota(remotePinned, tombstones) {
+  // Trim oldest tombstones first if we exceed item count
+  const totalItems = Object.keys(remotePinned).length + Object.keys(tombstones).length;
+  if (totalItems > SYNC_QUOTA_MAX_ITEMS - 10) { // leave headroom
+    const sorted = Object.entries(tombstones).sort((a, b) => a[1].removedAt - b[1].removedAt);
+    while (Object.keys(tombstones).length > 50 && sorted.length > 0) {
+      const [url] = sorted.shift();
+      delete tombstones[url];
+    }
+  }
+
+  // Check per-item size limits and warn
+  for (const key of ['pinnedTabs', 'tombstones']) {
+    const obj = key === 'pinnedTabs' ? remotePinned : tombstones;
+    const size = estimateJsonSize(obj);
+    if (size > SYNC_QUOTA_BYTES_PER_ITEM - 512) {
+      console.warn(LOG_PREFIX, `${key} approaching sync quota: ${size}/${SYNC_QUOTA_BYTES_PER_ITEM} bytes`);
     }
   }
 }
@@ -65,8 +126,18 @@ async function reconcile(trigger) {
   try {
     // 1. Read remote state
     const syncData = await chrome.storage.sync.get(['pinnedTabs', 'tombstones', 'meta']);
-    const remotePinned = syncData.pinnedTabs || {};
-    const tombstones = syncData.tombstones || {};
+    let remotePinned = syncData.pinnedTabs || {};
+    let tombstones = syncData.tombstones || {};
+
+    // Validate remote data — reset if corrupted
+    if (!isValidPinnedTabs(remotePinned)) {
+      console.warn(LOG_PREFIX, 'Invalid pinnedTabs data, resetting');
+      remotePinned = {};
+    }
+    if (!isValidTombstones(tombstones)) {
+      console.warn(LOG_PREFIX, 'Invalid tombstones data, resetting');
+      tombstones = {};
+    }
     const now = Date.now();
 
     // 2. Read local state
@@ -287,15 +358,35 @@ async function reconcile(trigger) {
     }));
     await chrome.storage.local.set({ localSnapshot: finalSnapshot });
 
-    // 13. Write back to sync
-    await chrome.storage.sync.set({
-      pinnedTabs: remotePinned,
-      tombstones: tombstones,
-      meta: {
-        lastWriteAt: now,
-        version: 1
+    // 13. Update in-memory set of known pinned tab IDs
+    knownPinnedTabIds = new Set(freshTabs.filter(t => t.pinned).map(t => t.id));
+
+    // 14. Enforce sync storage quota before writing
+    enforceSyncQuota(remotePinned, tombstones);
+
+    // 15. Write back to sync
+    try {
+      await chrome.storage.sync.set({
+        pinnedTabs: remotePinned,
+        tombstones: tombstones,
+        meta: {
+          lastWriteAt: now,
+          version: 1
+        }
+      });
+    } catch (err) {
+      if (err.message && err.message.includes('QUOTA')) {
+        console.error(LOG_PREFIX, 'Sync storage quota exceeded, trimming tombstones');
+        // Emergency: clear all tombstones and retry
+        await chrome.storage.sync.set({
+          pinnedTabs: remotePinned,
+          tombstones: {},
+          meta: { lastWriteAt: now, version: 1 }
+        });
+      } else {
+        throw err;
       }
-    });
+    }
 
     console.log(LOG_PREFIX, 'Reconcile complete. Synced tabs:', desiredUrls.size);
   } catch (err) {
@@ -341,15 +432,35 @@ function onStorageChanged(changes, areaName) {
 
 function onTabUpdated(tabId, changeInfo, tab) {
   if (changeInfo.pinned !== undefined) {
+    // Update known set immediately
+    if (changeInfo.pinned) {
+      knownPinnedTabIds.add(tabId);
+    } else {
+      knownPinnedTabIds.delete(tabId);
+    }
     console.log(LOG_PREFIX, 'Tab pin state changed:', tab.url, 'pinned:', changeInfo.pinned);
     scheduleReconcile('pin-change');
+  } else if (changeInfo.url && tab.pinned) {
+    // A pinned tab navigated to a new URL — sync the change
+    console.log(LOG_PREFIX, 'Pinned tab URL changed:', changeInfo.url);
+    scheduleReconcile('pinned-url-change');
   }
 }
 
 function onTabRemoved(tabId, removeInfo) {
-  // Tab is gone — we can't check if it was pinned.
-  // Reconcile will compare against localSnapshot to detect if a pinned tab was closed.
-  scheduleReconcile('tab-removed');
+  // Only reconcile if this tab was (or might have been) pinned
+  // This avoids unnecessary reconciles when regular tabs are closed
+  if (knownPinnedTabIds.size === 0 || knownPinnedTabIds.has(tabId)) {
+    knownPinnedTabIds.delete(tabId);
+    scheduleReconcile('tab-removed');
+  }
+}
+
+function onTabMoved(tabId, moveInfo) {
+  // Sync reorder when user manually moves a pinned tab
+  if (knownPinnedTabIds.has(tabId)) {
+    scheduleReconcile('tab-moved');
+  }
 }
 
 function onAlarm(alarm) {
@@ -377,8 +488,12 @@ function onMessage(msg, sender, sendResponse) {
       chrome.storage.sync.clear(),
       chrome.storage.local.clear()
     ]).then(() => {
+      knownPinnedTabIds.clear();
       console.log(LOG_PREFIX, 'Storage reset');
       sendResponse({ ok: true });
+    }).catch(err => {
+      console.error(LOG_PREFIX, 'Reset failed:', err);
+      sendResponse({ ok: false, error: err.message });
     });
     return true;
   }
@@ -390,6 +505,7 @@ chrome.runtime.onStartup.addListener(onStartup);
 chrome.storage.onChanged.addListener(onStorageChanged);
 chrome.tabs.onUpdated.addListener(onTabUpdated);
 chrome.tabs.onRemoved.addListener(onTabRemoved);
+chrome.tabs.onMoved.addListener(onTabMoved);
 chrome.alarms.onAlarm.addListener(onAlarm);
 chrome.runtime.onMessage.addListener(onMessage);
 
