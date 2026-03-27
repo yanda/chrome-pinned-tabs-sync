@@ -241,6 +241,11 @@ async function reconcile(trigger) {
           const oldEntry = remotePinned[snapshotUrl];
           remotePinned[newUrl] = { addedAt: oldEntry.addedAt, order: oldEntry.order };
           delete remotePinned[snapshotUrl];
+        } else {
+          // Old URL not in remote (e.g., removed by another device mid-sync).
+          // Preserve the tab's current local index as its order so it doesn't jump to the end.
+          const tab = currentLocalUrls.get(newUrl);
+          remotePinned[newUrl] = { addedAt: now, order: tab ? tab.index : maxOrder + 1 };
         }
         // Clean up any tombstone for the new URL
         delete tombstones[newUrl];
