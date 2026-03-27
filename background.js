@@ -25,6 +25,23 @@ function isSyncableUrl(url) {
   return url && (url.startsWith('http://') || url.startsWith('https://'));
 }
 
+// === Tab Operation Helper (retries on "cannot be edited" errors) ===
+
+async function safeTabOp(operation, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (err.message && err.message.includes('cannot be edited') && attempt < maxRetries) {
+        console.log(LOG_PREFIX, `Tab busy, retrying in ${(attempt + 1)}s...`);
+        await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // === Main Window Helper ===
 
 async function getMainWindowId() {
@@ -79,7 +96,7 @@ async function reconcile(trigger) {
       for (let i = 1; i < tabs.length; i++) {
         console.log(LOG_PREFIX, 'Closing duplicate pinned tab:', url);
         try {
-          await chrome.tabs.remove(tabs[i].id);
+          await safeTabOp(() => chrome.tabs.remove(tabs[i].id));
         } catch (err) {
           console.error(LOG_PREFIX, 'Failed to close duplicate:', url, err);
         }
@@ -214,12 +231,12 @@ async function reconcile(trigger) {
         }
         console.log(LOG_PREFIX, 'Creating pinned tab:', url);
         try {
-          await chrome.tabs.create({
+          await safeTabOp(() => chrome.tabs.create({
             url: url,
             pinned: true,
             active: false,
             windowId: mainWindowId
-          });
+          }));
         } catch (err) {
           console.error(LOG_PREFIX, 'Failed to create tab:', url, err);
         }
@@ -231,7 +248,7 @@ async function reconcile(trigger) {
       if (!desiredUrls.has(url)) {
         console.log(LOG_PREFIX, 'Unpinning tab:', url);
         try {
-          await chrome.tabs.update(tab.id, { pinned: false });
+          await safeTabOp(() => chrome.tabs.update(tab.id, { pinned: false }));
         } catch (err) {
           console.error(LOG_PREFIX, 'Failed to unpin tab:', url, err);
         }
@@ -251,7 +268,7 @@ async function reconcile(trigger) {
       const tab = freshPinnedTabs.find(t => normalizeUrl(t.url) === url);
       if (tab && tab.index !== i) {
         try {
-          await chrome.tabs.move(tab.id, { index: i });
+          await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
         } catch (err) {
           console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
         }
@@ -303,7 +320,8 @@ function scheduleReconcile(trigger) {
 function onInstalled(details) {
   console.log(LOG_PREFIX, 'Installed, reason:', details.reason);
   if (details.reason === 'install' || details.reason === 'update') {
-    reconcile('install');
+    // Delay after install/reload — Chrome isn't ready for tab operations immediately
+    setTimeout(() => reconcile('install'), 3000);
   }
 }
 
