@@ -92,16 +92,50 @@ async function reconcile(trigger) {
       currentLocalUrls.set(url, tabs[0]);
     }
 
-    // 3. Read previous snapshot
+    // 3. Read previous snapshot (stores {url, tabId} pairs to detect URL changes vs unpins)
     const localData = await chrome.storage.local.get(['localSnapshot']);
-    const previousSnapshot = new Set(localData.localSnapshot || []);
+    const rawSnapshot = localData.localSnapshot || [];
+    // Build lookup maps from snapshot
+    const snapshotUrlToTabId = new Map();  // url -> tabId
+    const snapshotTabIdToUrl = new Map();  // tabId -> url
+    for (const entry of rawSnapshot) {
+      if (typeof entry === 'string') {
+        // Legacy format (plain URL array) — no tabId tracking
+        snapshotUrlToTabId.set(entry, null);
+      } else {
+        snapshotUrlToTabId.set(entry.url, entry.tabId);
+        snapshotTabIdToUrl.set(entry.tabId, entry.url);
+      }
+    }
 
-    // 4. Detect local unpins (was in snapshot, no longer pinned locally)
-    for (const url of previousSnapshot) {
-      if (!currentLocalUrls.has(url)) {
-        console.log(LOG_PREFIX, 'Detected local unpin:', url);
-        tombstones[url] = { removedAt: now };
-        delete remotePinned[url];
+    // Build current tabId -> url map
+    const currentTabIdToUrl = new Map();
+    for (const [url, tab] of currentLocalUrls) {
+      currentTabIdToUrl.set(tab.id, url);
+    }
+
+    // 4. Detect local unpins vs URL changes within the same tab
+    for (const [snapshotUrl, snapshotTabId] of snapshotUrlToTabId) {
+      if (currentLocalUrls.has(snapshotUrl)) continue; // URL still present, no change
+
+      // URL is gone — check if the tab still exists with a different URL
+      const newUrl = snapshotTabId != null ? currentTabIdToUrl.get(snapshotTabId) : null;
+
+      if (newUrl && newUrl !== snapshotUrl) {
+        // Same tab, URL changed (e.g., redirect after load). Update remote entry, preserve order.
+        console.log(LOG_PREFIX, 'URL changed in same tab:', snapshotUrl, '->', newUrl);
+        if (remotePinned[snapshotUrl]) {
+          const oldEntry = remotePinned[snapshotUrl];
+          remotePinned[newUrl] = { addedAt: oldEntry.addedAt, order: oldEntry.order };
+          delete remotePinned[snapshotUrl];
+        }
+        // Clean up any tombstone for the new URL
+        delete tombstones[newUrl];
+      } else {
+        // Tab is gone — this is a real unpin/close
+        console.log(LOG_PREFIX, 'Detected local unpin:', snapshotUrl);
+        tombstones[snapshotUrl] = { removedAt: now };
+        delete remotePinned[snapshotUrl];
       }
     }
 
@@ -199,8 +233,16 @@ async function reconcile(trigger) {
       }
     }
 
-    // 12. Update local snapshot
-    const finalSnapshot = [...desiredUrls];
+    // 12. Update local snapshot (store {url, tabId} pairs for URL-change detection)
+    const freshTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+    const freshTabsByUrl = new Map();
+    for (const tab of freshTabs) {
+      freshTabsByUrl.set(normalizeUrl(tab.url), tab.id);
+    }
+    const finalSnapshot = [...desiredUrls].map(url => ({
+      url,
+      tabId: freshTabsByUrl.get(url) || null
+    }));
     await chrome.storage.local.set({ localSnapshot: finalSnapshot });
 
     // 13. Write back to sync
