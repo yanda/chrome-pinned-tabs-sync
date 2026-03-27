@@ -8,6 +8,8 @@ const LOG_PREFIX = '[PinnedTabsSync]';
 // === State (in-memory, resets on worker restart) ===
 let isSyncing = false;
 let debounceTimer = null;
+let pendingReconcileTrigger = null; // Queued trigger when reconcile is skipped due to isSyncing
+let knownPinnedTabIds = new Set(); // Track pinned tab IDs to filter onTabRemoved noise
 
 // === URL Utilities ===
 
@@ -32,12 +34,72 @@ async function safeTabOp(operation, maxRetries = 3) {
     try {
       return await operation();
     } catch (err) {
-      if (err.message && err.message.includes('cannot be edited') && attempt < maxRetries) {
+      const msg = err.message || '';
+      // Non-retryable: tab no longer exists
+      if (msg.includes('No tab with id') || msg.includes('No current window')) {
+        console.warn(LOG_PREFIX, 'Tab/window gone, skipping:', msg);
+        return null;
+      }
+      // Retryable: tab is temporarily locked
+      if (msg.includes('cannot be edited') && attempt < maxRetries) {
         console.log(LOG_PREFIX, `Tab busy, retrying in ${(attempt + 1)}s...`);
         await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
         continue;
       }
       throw err;
+    }
+  }
+}
+
+// === Data Validation ===
+
+function isValidPinnedTabs(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return false;
+  for (const [url, entry] of Object.entries(obj)) {
+    if (typeof url !== 'string') return false;
+    if (typeof entry !== 'object' || entry === null) return false;
+    if (typeof entry.addedAt !== 'number') return false;
+    if (entry.order !== undefined && typeof entry.order !== 'number') return false;
+  }
+  return true;
+}
+
+function isValidTombstones(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return false;
+  for (const [url, entry] of Object.entries(obj)) {
+    if (typeof url !== 'string') return false;
+    if (typeof entry !== 'object' || entry === null) return false;
+    if (typeof entry.removedAt !== 'number') return false;
+  }
+  return true;
+}
+
+// === Storage Quota Protection ===
+
+const SYNC_QUOTA_BYTES_PER_ITEM = 8192;
+const SYNC_QUOTA_MAX_ITEMS = 512;
+
+function estimateJsonSize(obj) {
+  return new Blob([JSON.stringify(obj)]).size;
+}
+
+function enforceSyncQuota(remotePinned, tombstones) {
+  // Trim oldest tombstones first if we exceed item count
+  const totalItems = Object.keys(remotePinned).length + Object.keys(tombstones).length;
+  if (totalItems > SYNC_QUOTA_MAX_ITEMS - 10) { // leave headroom
+    const sorted = Object.entries(tombstones).sort((a, b) => a[1].removedAt - b[1].removedAt);
+    while (Object.keys(tombstones).length > 50 && sorted.length > 0) {
+      const [url] = sorted.shift();
+      delete tombstones[url];
+    }
+  }
+
+  // Check per-item size limits and warn
+  for (const key of ['pinnedTabs', 'tombstones']) {
+    const obj = key === 'pinnedTabs' ? remotePinned : tombstones;
+    const size = estimateJsonSize(obj);
+    if (size > SYNC_QUOTA_BYTES_PER_ITEM - 512) {
+      console.warn(LOG_PREFIX, `${key} approaching sync quota: ${size}/${SYNC_QUOTA_BYTES_PER_ITEM} bytes`);
     }
   }
 }
@@ -56,7 +118,8 @@ async function getMainWindowId() {
 
 async function reconcile(trigger) {
   if (isSyncing) {
-    console.log(LOG_PREFIX, 'Skipping reconcile (already syncing), trigger:', trigger);
+    console.log(LOG_PREFIX, 'Queuing reconcile (already syncing), trigger:', trigger);
+    pendingReconcileTrigger = trigger;
     return;
   }
   isSyncing = true;
@@ -65,8 +128,18 @@ async function reconcile(trigger) {
   try {
     // 1. Read remote state
     const syncData = await chrome.storage.sync.get(['pinnedTabs', 'tombstones', 'meta']);
-    const remotePinned = syncData.pinnedTabs || {};
-    const tombstones = syncData.tombstones || {};
+    let remotePinned = syncData.pinnedTabs || {};
+    let tombstones = syncData.tombstones || {};
+
+    // Validate remote data — reset if corrupted
+    if (!isValidPinnedTabs(remotePinned)) {
+      console.warn(LOG_PREFIX, 'Invalid pinnedTabs data, resetting');
+      remotePinned = {};
+    }
+    if (!isValidTombstones(tombstones)) {
+      console.warn(LOG_PREFIX, 'Invalid tombstones data, resetting');
+      tombstones = {};
+    }
     const now = Date.now();
 
     // 2. Read local state
@@ -111,7 +184,7 @@ async function reconcile(trigger) {
 
     // 3. Read previous snapshot (stores {url, tabId} pairs to detect URL changes vs unpins)
     const localData = await chrome.storage.local.get(['localSnapshot']);
-    const rawSnapshot = localData.localSnapshot || [];
+    const rawSnapshot = Array.isArray(localData.localSnapshot) ? localData.localSnapshot : [];
     // Build lookup maps from snapshot
     const snapshotUrlToTabId = new Map();  // url -> tabId
     const snapshotTabIdToUrl = new Map();  // tabId -> url
@@ -119,16 +192,25 @@ async function reconcile(trigger) {
       if (typeof entry === 'string') {
         // Legacy format (plain URL array) — no tabId tracking
         snapshotUrlToTabId.set(entry, null);
-      } else {
+      } else if (entry && typeof entry === 'object' && typeof entry.url === 'string') {
         snapshotUrlToTabId.set(entry.url, entry.tabId);
-        snapshotTabIdToUrl.set(entry.tabId, entry.url);
+        if (entry.tabId != null) {
+          snapshotTabIdToUrl.set(entry.tabId, entry.url);
+        }
       }
+      // Skip malformed entries silently
     }
 
     // Build current tabId -> url map
     const currentTabIdToUrl = new Map();
     for (const [url, tab] of currentLocalUrls) {
       currentTabIdToUrl.set(tab.id, url);
+    }
+
+    // Compute maxOrder early — needed for fallback ordering in step 4 and step 5
+    let maxOrder = 0;
+    for (const entry of Object.values(remotePinned)) {
+      if ((entry.order || 0) > maxOrder) maxOrder = entry.order || 0;
     }
 
     // 4. Detect local unpins vs URL changes within the same tab
@@ -170,6 +252,11 @@ async function reconcile(trigger) {
           const oldEntry = remotePinned[snapshotUrl];
           remotePinned[newUrl] = { addedAt: oldEntry.addedAt, order: oldEntry.order };
           delete remotePinned[snapshotUrl];
+        } else {
+          // Old URL not in remote (e.g., removed by another device mid-sync).
+          // Preserve the tab's current local index as its order so it doesn't jump to the end.
+          const tab = currentLocalUrls.get(newUrl);
+          remotePinned[newUrl] = { addedAt: now, order: tab ? tab.index : maxOrder + 1 };
         }
         // Clean up any tombstone for the new URL
         delete tombstones[newUrl];
@@ -182,11 +269,6 @@ async function reconcile(trigger) {
     }
 
     // 5. Detect new local pins (pinned locally, not in remote)
-    let maxOrder = 0;
-    for (const entry of Object.values(remotePinned)) {
-      if ((entry.order || 0) > maxOrder) maxOrder = entry.order || 0;
-    }
-
     for (const [url] of currentLocalUrls) {
       if (!remotePinned[url]) {
         // Check if there's a very recent tombstone (< 60s) — likely our own unpin propagating
@@ -255,22 +337,42 @@ async function reconcile(trigger) {
       }
     }
 
-    // 11. Reorder pinned tabs to match desired order
-    //     Move left-to-right so each placed tab is in its final position.
-    //     Re-query after each move since indices shift.
-    const orderedUrls = [...desiredUrls].sort(
-      (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
-    );
+    // 11. Reorder: either push local order to remote, or pull remote order to local.
+    //     On local triggers (tab-moved, pin-change), adopt local tab positions as the
+    //     source of truth for order. On remote triggers (sync-change, startup, periodic,
+    //     install), reorder local tabs to match remote order.
+    const localOrderTriggers = new Set(['tab-moved', 'pin-change', 'pinned-url-change']);
+    if (localOrderTriggers.has(trigger)) {
+      // Push local positions into remote order values
+      const currentPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+      for (const tab of currentPinnedTabs) {
+        const url = normalizeUrl(tab.url);
+        if (remotePinned[url]) {
+          remotePinned[url].order = tab.index;
+        }
+      }
+    } else {
+      // Pull remote order to local: move tabs to match desired order
+      const orderedUrls = [...desiredUrls].sort(
+        (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
+      );
 
-    for (let i = 0; i < orderedUrls.length; i++) {
-      const url = orderedUrls[i];
-      const freshPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
-      const tab = freshPinnedTabs.find(t => normalizeUrl(t.url) === url);
-      if (tab && tab.index !== i) {
-        try {
-          await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
-        } catch (err) {
-          console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
+      let reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+      let needsRequery = false;
+      for (let i = 0; i < orderedUrls.length; i++) {
+        const url = orderedUrls[i];
+        if (needsRequery) {
+          reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+          needsRequery = false;
+        }
+        const tab = reorderTabs.find(t => normalizeUrl(t.url) === url);
+        if (tab && tab.index !== i) {
+          try {
+            await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
+            needsRequery = true;
+          } catch (err) {
+            console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
+          }
         }
       }
     }
@@ -287,21 +389,47 @@ async function reconcile(trigger) {
     }));
     await chrome.storage.local.set({ localSnapshot: finalSnapshot });
 
-    // 13. Write back to sync
-    await chrome.storage.sync.set({
-      pinnedTabs: remotePinned,
-      tombstones: tombstones,
-      meta: {
-        lastWriteAt: now,
-        version: 1
+    // 13. Update in-memory set of known pinned tab IDs
+    knownPinnedTabIds = new Set(freshTabs.filter(t => t.pinned).map(t => t.id));
+
+    // 14. Enforce sync storage quota before writing
+    enforceSyncQuota(remotePinned, tombstones);
+
+    // 15. Write back to sync
+    try {
+      await chrome.storage.sync.set({
+        pinnedTabs: remotePinned,
+        tombstones: tombstones,
+        meta: {
+          lastWriteAt: now,
+          version: 1
+        }
+      });
+    } catch (err) {
+      if (err.message && err.message.includes('QUOTA')) {
+        console.error(LOG_PREFIX, 'Sync storage quota exceeded, trimming tombstones');
+        // Emergency: clear all tombstones and retry
+        await chrome.storage.sync.set({
+          pinnedTabs: remotePinned,
+          tombstones: {},
+          meta: { lastWriteAt: now, version: 1 }
+        });
+      } else {
+        throw err;
       }
-    });
+    }
 
     console.log(LOG_PREFIX, 'Reconcile complete. Synced tabs:', desiredUrls.size);
   } catch (err) {
     console.error(LOG_PREFIX, 'Reconcile error:', err);
   } finally {
     isSyncing = false;
+    // Process any reconcile that was queued while we were syncing
+    if (pendingReconcileTrigger) {
+      const queuedTrigger = pendingReconcileTrigger;
+      pendingReconcileTrigger = null;
+      scheduleReconcile(queuedTrigger);
+    }
   }
 }
 
@@ -319,6 +447,7 @@ function scheduleReconcile(trigger) {
 
 function onInstalled(details) {
   console.log(LOG_PREFIX, 'Installed, reason:', details.reason);
+  ensureAlarm();
   if (details.reason === 'install' || details.reason === 'update') {
     // Delay after install/reload — Chrome isn't ready for tab operations immediately
     setTimeout(() => reconcile('install'), 3000);
@@ -327,13 +456,19 @@ function onInstalled(details) {
 
 function onStartup() {
   console.log(LOG_PREFIX, 'Browser startup');
+  ensureAlarm();
   reconcile('startup');
 }
 
 function onStorageChanged(changes, areaName) {
   if (areaName !== 'sync') return;
-  if (isSyncing) return;
   if (changes.pinnedTabs || changes.tombstones) {
+    if (isSyncing) {
+      // Queue so the change is picked up after current reconcile finishes
+      console.log(LOG_PREFIX, 'Sync storage changed while syncing, queuing');
+      pendingReconcileTrigger = 'sync-change';
+      return;
+    }
     console.log(LOG_PREFIX, 'Sync storage changed externally');
     scheduleReconcile('sync-change');
   }
@@ -341,26 +476,65 @@ function onStorageChanged(changes, areaName) {
 
 function onTabUpdated(tabId, changeInfo, tab) {
   if (changeInfo.pinned !== undefined) {
+    // Update known set immediately
+    if (changeInfo.pinned) {
+      knownPinnedTabIds.add(tabId);
+    } else {
+      knownPinnedTabIds.delete(tabId);
+    }
     console.log(LOG_PREFIX, 'Tab pin state changed:', tab.url, 'pinned:', changeInfo.pinned);
     scheduleReconcile('pin-change');
+  } else if (changeInfo.url && tab.pinned && isSyncableUrl(changeInfo.url)) {
+    // A pinned tab navigated to a new syncable URL — sync the change
+    console.log(LOG_PREFIX, 'Pinned tab URL changed:', changeInfo.url);
+    scheduleReconcile('pinned-url-change');
   }
 }
 
 function onTabRemoved(tabId, removeInfo) {
-  // Tab is gone — we can't check if it was pinned.
-  // Reconcile will compare against localSnapshot to detect if a pinned tab was closed.
-  scheduleReconcile('tab-removed');
+  // Skip during window close — all tabs fire onRemoved, reconcile would error
+  if (removeInfo.isWindowClosing) return;
+  // Only reconcile if this tab was (or might have been) pinned
+  // This avoids unnecessary reconciles when regular tabs are closed
+  if (knownPinnedTabIds.size === 0 || knownPinnedTabIds.has(tabId)) {
+    knownPinnedTabIds.delete(tabId);
+    scheduleReconcile('tab-removed');
+  }
 }
 
-function onAlarm(alarm) {
+function onTabMoved(tabId, moveInfo) {
+  // Sync reorder when user manually moves a pinned tab.
+  // We update remote order values from current local positions
+  // rather than re-imposing the old remote order.
+  if (knownPinnedTabIds.has(tabId)) {
+    scheduleReconcile('tab-moved');
+  }
+}
+
+async function onAlarm(alarm) {
   if (alarm.name === ALARM_NAME) {
     reconcile('periodic');
   }
 }
 
+// Re-create alarm if it was lost (e.g., after long sleep/suspend)
+async function ensureAlarm() {
+  const existing = await chrome.alarms.get(ALARM_NAME);
+  if (!existing) {
+    console.warn(LOG_PREFIX, 'Periodic alarm was missing, re-creating');
+    chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_PERIOD_MINUTES });
+  }
+}
+
 function onMessage(msg, sender, sendResponse) {
+  if (!msg || typeof msg !== 'object') return;
   if (msg.action === 'syncNow') {
-    reconcile('manual').then(() => sendResponse({ ok: true }));
+    reconcile('manual')
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => {
+        console.error(LOG_PREFIX, 'Manual sync failed:', err);
+        sendResponse({ ok: false, error: err.message });
+      });
     return true;
   }
   if (msg.action === 'getStatus') {
@@ -369,6 +543,9 @@ function onMessage(msg, sender, sendResponse) {
       chrome.storage.local.get(['localSnapshot'])
     ]).then(([syncData, localData]) => {
       sendResponse({ ...syncData, localSnapshot: localData.localSnapshot });
+    }).catch(err => {
+      console.error(LOG_PREFIX, 'getStatus failed:', err);
+      sendResponse({ pinnedTabs: {}, tombstones: {}, meta: {} });
     });
     return true;
   }
@@ -377,8 +554,12 @@ function onMessage(msg, sender, sendResponse) {
       chrome.storage.sync.clear(),
       chrome.storage.local.clear()
     ]).then(() => {
+      knownPinnedTabIds.clear();
       console.log(LOG_PREFIX, 'Storage reset');
       sendResponse({ ok: true });
+    }).catch(err => {
+      console.error(LOG_PREFIX, 'Reset failed:', err);
+      sendResponse({ ok: false, error: err.message });
     });
     return true;
   }
@@ -390,6 +571,7 @@ chrome.runtime.onStartup.addListener(onStartup);
 chrome.storage.onChanged.addListener(onStorageChanged);
 chrome.tabs.onUpdated.addListener(onTabUpdated);
 chrome.tabs.onRemoved.addListener(onTabRemoved);
+chrome.tabs.onMoved.addListener(onTabMoved);
 chrome.alarms.onAlarm.addListener(onAlarm);
 chrome.runtime.onMessage.addListener(onMessage);
 

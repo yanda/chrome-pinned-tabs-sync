@@ -34,6 +34,7 @@ function formatUrl(url) {
 
 function timeAgo(timestamp) {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (seconds < 0) return 'just now'; // clock skew — treat future timestamps as now
   if (seconds < 60) return 'just now';
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
@@ -46,6 +47,11 @@ function timeAgo(timestamp) {
 async function loadStatus() {
   try {
     const data = await chrome.runtime.sendMessage({ action: 'getStatus' });
+    if (!data || typeof data !== 'object') {
+      statusText.textContent = 'Waiting for service worker...';
+      statusDot.className = 'dot stale';
+      return;
+    }
     const pinnedTabs = data.pinnedTabs || {};
     const tombstones = data.tombstones || {};
     const meta = data.meta || {};
@@ -112,6 +118,14 @@ async function loadStatus() {
       tombstonesSection.style.display = 'none';
     }
   } catch (err) {
+    // Extension context can be invalidated after update/reload
+    if (err.message && err.message.includes('Extension context invalidated')) {
+      statusText.textContent = 'Extension updated — please reopen popup';
+      statusDot.className = 'dot stale';
+      syncBtn.disabled = true;
+      resetBtn.disabled = true;
+      return;
+    }
     statusText.textContent = 'Error loading status';
     statusDot.className = 'dot error';
     console.error('Popup error:', err);
@@ -120,12 +134,18 @@ async function loadStatus() {
 
 // Welcome dismiss
 welcomeDismiss.addEventListener('click', async () => {
-  await chrome.storage.local.set({ welcomeDismissed: true });
-  welcome.style.display = 'none';
-  mainContent.style.display = 'block';
-  // Trigger first sync
-  await chrome.runtime.sendMessage({ action: 'syncNow' });
-  await loadStatus();
+  try {
+    await chrome.storage.local.set({ welcomeDismissed: true });
+    welcome.style.display = 'none';
+    mainContent.style.display = 'block';
+    // Trigger first sync
+    await chrome.runtime.sendMessage({ action: 'syncNow' });
+    await loadStatus();
+  } catch (err) {
+    console.error('Welcome dismiss error:', err);
+    statusText.textContent = 'Sync failed — try reopening popup';
+    statusDot.className = 'dot error';
+  }
 });
 
 // Sync Now
@@ -135,6 +155,10 @@ syncBtn.addEventListener('click', async () => {
   try {
     await chrome.runtime.sendMessage({ action: 'syncNow' });
     await loadStatus();
+  } catch (err) {
+    console.error('Sync button error:', err);
+    statusText.textContent = 'Sync failed — try reopening popup';
+    statusDot.className = 'dot error';
   } finally {
     syncBtn.disabled = false;
     syncBtn.textContent = 'Sync Now';
@@ -159,6 +183,10 @@ resetYes.addEventListener('click', async () => {
     resetConfirm.style.display = 'none';
     resetBtn.style.display = '';
     await loadStatus();
+  } catch (err) {
+    console.error('Reset error:', err);
+    statusText.textContent = 'Reset failed — try reopening popup';
+    statusDot.className = 'dot error';
   } finally {
     resetYes.disabled = false;
   }
