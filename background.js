@@ -8,6 +8,7 @@ const LOG_PREFIX = '[PinnedTabsSync]';
 // === State (in-memory, resets on worker restart) ===
 let isSyncing = false;
 let debounceTimer = null;
+let pendingReconcileTrigger = null; // Queued trigger when reconcile is skipped due to isSyncing
 let knownPinnedTabIds = new Set(); // Track pinned tab IDs to filter onTabRemoved noise
 
 // === URL Utilities ===
@@ -117,7 +118,8 @@ async function getMainWindowId() {
 
 async function reconcile(trigger) {
   if (isSyncing) {
-    console.log(LOG_PREFIX, 'Skipping reconcile (already syncing), trigger:', trigger);
+    console.log(LOG_PREFIX, 'Queuing reconcile (already syncing), trigger:', trigger);
+    pendingReconcileTrigger = trigger;
     return;
   }
   isSyncing = true;
@@ -182,7 +184,7 @@ async function reconcile(trigger) {
 
     // 3. Read previous snapshot (stores {url, tabId} pairs to detect URL changes vs unpins)
     const localData = await chrome.storage.local.get(['localSnapshot']);
-    const rawSnapshot = localData.localSnapshot || [];
+    const rawSnapshot = Array.isArray(localData.localSnapshot) ? localData.localSnapshot : [];
     // Build lookup maps from snapshot
     const snapshotUrlToTabId = new Map();  // url -> tabId
     const snapshotTabIdToUrl = new Map();  // tabId -> url
@@ -190,16 +192,25 @@ async function reconcile(trigger) {
       if (typeof entry === 'string') {
         // Legacy format (plain URL array) — no tabId tracking
         snapshotUrlToTabId.set(entry, null);
-      } else {
+      } else if (entry && typeof entry === 'object' && typeof entry.url === 'string') {
         snapshotUrlToTabId.set(entry.url, entry.tabId);
-        snapshotTabIdToUrl.set(entry.tabId, entry.url);
+        if (entry.tabId != null) {
+          snapshotTabIdToUrl.set(entry.tabId, entry.url);
+        }
       }
+      // Skip malformed entries silently
     }
 
     // Build current tabId -> url map
     const currentTabIdToUrl = new Map();
     for (const [url, tab] of currentLocalUrls) {
       currentTabIdToUrl.set(tab.id, url);
+    }
+
+    // Compute maxOrder early — needed for fallback ordering in step 4 and step 5
+    let maxOrder = 0;
+    for (const entry of Object.values(remotePinned)) {
+      if ((entry.order || 0) > maxOrder) maxOrder = entry.order || 0;
     }
 
     // 4. Detect local unpins vs URL changes within the same tab
@@ -258,11 +269,6 @@ async function reconcile(trigger) {
     }
 
     // 5. Detect new local pins (pinned locally, not in remote)
-    let maxOrder = 0;
-    for (const entry of Object.values(remotePinned)) {
-      if ((entry.order || 0) > maxOrder) maxOrder = entry.order || 0;
-    }
-
     for (const [url] of currentLocalUrls) {
       if (!remotePinned[url]) {
         // Check if there's a very recent tombstone (< 60s) — likely our own unpin propagating
@@ -332,19 +338,26 @@ async function reconcile(trigger) {
     }
 
     // 11. Reorder pinned tabs to match desired order
-    //     Move left-to-right so each placed tab is in its final position.
-    //     Re-query after each move since indices shift.
+    //     Build the desired order, then only move tabs that are out of place.
+    //     Re-query once after all creates/unpins, then move left-to-right.
     const orderedUrls = [...desiredUrls].sort(
       (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
     );
 
+    let reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+    let needsRequery = false;
     for (let i = 0; i < orderedUrls.length; i++) {
       const url = orderedUrls[i];
-      const freshPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
-      const tab = freshPinnedTabs.find(t => normalizeUrl(t.url) === url);
+      // Re-query only if a previous move shifted indices
+      if (needsRequery) {
+        reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+        needsRequery = false;
+      }
+      const tab = reorderTabs.find(t => normalizeUrl(t.url) === url);
       if (tab && tab.index !== i) {
         try {
           await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
+          needsRequery = true;
         } catch (err) {
           console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
         }
@@ -398,6 +411,12 @@ async function reconcile(trigger) {
     console.error(LOG_PREFIX, 'Reconcile error:', err);
   } finally {
     isSyncing = false;
+    // Process any reconcile that was queued while we were syncing
+    if (pendingReconcileTrigger) {
+      const queuedTrigger = pendingReconcileTrigger;
+      pendingReconcileTrigger = null;
+      scheduleReconcile(queuedTrigger);
+    }
   }
 }
 
@@ -453,6 +472,8 @@ function onTabUpdated(tabId, changeInfo, tab) {
 }
 
 function onTabRemoved(tabId, removeInfo) {
+  // Skip during window close — all tabs fire onRemoved, reconcile would error
+  if (removeInfo.isWindowClosing) return;
   // Only reconcile if this tab was (or might have been) pinned
   // This avoids unnecessary reconciles when regular tabs are closed
   if (knownPinnedTabIds.size === 0 || knownPinnedTabIds.has(tabId)) {
