@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy — Pinned Tabs Sync</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 640px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+    h1 { font-size: 24px; margin-bottom: 4px; }
+    h2 { font-size: 18px; margin-top: 32px; }
+    .updated { color: #666; font-size: 14px; margin-bottom: 32px; }
+    a { color: #4285F4; }
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Last updated: March 26, 2026</p>
+
+  <p><strong>Pinned Tabs Sync</strong> is a Chrome extension that synchronizes your pinned tabs across your devices. Your privacy is important to us, and this extension is designed to keep your data entirely within your control.</p>
+
+  <h2>Data we collect</h2>
+  <p>None. This extension does not collect, transmit, or store any personal data on external servers.</p>
+
+  <h2>Data stored by the extension</h2>
+  <p>The extension stores the following data using Chrome's built-in storage APIs:</p>
+  <ul>
+    <li><strong>Pinned tab URLs</strong> — stored in <code>chrome.storage.sync</code> so they can sync across your devices via your Google account. This data never leaves Google's sync infrastructure.</li>
+    <li><strong>Local tab snapshot</strong> — stored in <code>chrome.storage.local</code> to detect when you unpin a tab. This data stays on your device.</li>
+  </ul>
+  <p>No browsing history, passwords, form data, or other personal information is accessed or stored.</p>
+
+  <h2>Permissions</h2>
+  <ul>
+    <li><strong>tabs</strong> — Required to read the URLs of your pinned tabs so they can be synced. The extension only reads pinned tab URLs; it does not monitor your browsing activity.</li>
+    <li><strong>storage</strong> — Required to save and sync pinned tab data across your devices.</li>
+    <li><strong>alarms</strong> — Required for periodic sync checks (every 5 minutes) to ensure tabs stay in sync.</li>
+  </ul>
+
+  <h2>Third-party services</h2>
+  <p>This extension does not communicate with any third-party servers. All data synchronization happens through Chrome's built-in sync service, governed by <a href="https://policies.google.com/privacy">Google's Privacy Policy</a>.</p>
+
+  <h2>Data deletion</h2>
+  <p>You can delete all extension data at any time by clicking the "Reset" button in the extension popup, or by uninstalling the extension. Uninstalling removes all locally stored data. Synced data can be cleared from your Google account at <a href="https://chrome.google.com/sync">chrome.google.com/sync</a>.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>If this policy is updated, the changes will be posted on this page with a revised date.</p>
+
+  <h2>Contact</h2>
+  <p>For questions about this privacy policy, please open an issue on the <a href="https://github.com/yanda/chrome-pinned-tabs-sync">GitHub repository</a>.</p>
+</body>
+</html>
