@@ -64,9 +64,32 @@ async function reconcile(trigger) {
       .filter(t => isSyncableUrl(t.url))
       .sort((a, b) => a.index - b.index);
 
-    const currentLocalUrls = new Map();
+    // Group tabs by normalized URL to detect duplicates
+    const tabsByUrl = new Map();
     for (const tab of localPinned) {
-      currentLocalUrls.set(normalizeUrl(tab.url), tab);
+      const url = normalizeUrl(tab.url);
+      if (!tabsByUrl.has(url)) {
+        tabsByUrl.set(url, []);
+      }
+      tabsByUrl.get(url).push(tab);
+    }
+
+    // Close duplicate pinned tabs (keep the first, close the rest)
+    for (const [url, tabs] of tabsByUrl) {
+      for (let i = 1; i < tabs.length; i++) {
+        console.log(LOG_PREFIX, 'Closing duplicate pinned tab:', url);
+        try {
+          await chrome.tabs.remove(tabs[i].id);
+        } catch (err) {
+          console.error(LOG_PREFIX, 'Failed to close duplicate:', url, err);
+        }
+      }
+    }
+
+    // Build deduplicated map of URL -> tab (first occurrence)
+    const currentLocalUrls = new Map();
+    for (const [url, tabs] of tabsByUrl) {
+      currentLocalUrls.set(url, tabs[0]);
     }
 
     // 3. Read previous snapshot
@@ -118,9 +141,18 @@ async function reconcile(trigger) {
     // 8. Compute desired URL set
     const desiredUrls = new Set(Object.keys(remotePinned));
 
-    // 9. Create missing pinned tabs locally
-    for (const url of desiredUrls) {
-      if (!currentLocalUrls.has(url)) {
+    // 9. Create missing pinned tabs locally (skip if already pinned)
+    const urlsToCreate = [...desiredUrls].filter(url => !currentLocalUrls.has(url));
+    if (urlsToCreate.length > 0) {
+      // Re-query to catch any tabs we might have missed (e.g., non-syncable URLs that normalized the same)
+      const existingPinned = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+      const existingUrls = new Set(existingPinned.map(t => normalizeUrl(t.url)));
+
+      for (const url of urlsToCreate) {
+        if (existingUrls.has(url)) {
+          console.log(LOG_PREFIX, 'Tab already pinned, skipping:', url);
+          continue;
+        }
         console.log(LOG_PREFIX, 'Creating pinned tab:', url);
         try {
           await chrome.tabs.create({
@@ -148,13 +180,15 @@ async function reconcile(trigger) {
     }
 
     // 11. Reorder pinned tabs to match desired order
+    //     Move left-to-right so each placed tab is in its final position.
+    //     Re-query after each move since indices shift.
     const orderedUrls = [...desiredUrls].sort(
       (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
     );
 
-    const freshPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
     for (let i = 0; i < orderedUrls.length; i++) {
       const url = orderedUrls[i];
+      const freshPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
       const tab = freshPinnedTabs.find(t => normalizeUrl(t.url) === url);
       if (tab && tab.index !== i) {
         try {
