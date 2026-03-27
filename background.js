@@ -447,6 +447,7 @@ function scheduleReconcile(trigger) {
 
 function onInstalled(details) {
   console.log(LOG_PREFIX, 'Installed, reason:', details.reason);
+  ensureAlarm();
   if (details.reason === 'install' || details.reason === 'update') {
     // Delay after install/reload — Chrome isn't ready for tab operations immediately
     setTimeout(() => reconcile('install'), 3000);
@@ -455,6 +456,7 @@ function onInstalled(details) {
 
 function onStartup() {
   console.log(LOG_PREFIX, 'Browser startup');
+  ensureAlarm();
   reconcile('startup');
 }
 
@@ -482,8 +484,8 @@ function onTabUpdated(tabId, changeInfo, tab) {
     }
     console.log(LOG_PREFIX, 'Tab pin state changed:', tab.url, 'pinned:', changeInfo.pinned);
     scheduleReconcile('pin-change');
-  } else if (changeInfo.url && tab.pinned) {
-    // A pinned tab navigated to a new URL — sync the change
+  } else if (changeInfo.url && tab.pinned && isSyncableUrl(changeInfo.url)) {
+    // A pinned tab navigated to a new syncable URL — sync the change
     console.log(LOG_PREFIX, 'Pinned tab URL changed:', changeInfo.url);
     scheduleReconcile('pinned-url-change');
   }
@@ -509,13 +511,23 @@ function onTabMoved(tabId, moveInfo) {
   }
 }
 
-function onAlarm(alarm) {
+async function onAlarm(alarm) {
   if (alarm.name === ALARM_NAME) {
     reconcile('periodic');
   }
 }
 
+// Re-create alarm if it was lost (e.g., after long sleep/suspend)
+async function ensureAlarm() {
+  const existing = await chrome.alarms.get(ALARM_NAME);
+  if (!existing) {
+    console.warn(LOG_PREFIX, 'Periodic alarm was missing, re-creating');
+    chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_PERIOD_MINUTES });
+  }
+}
+
 function onMessage(msg, sender, sendResponse) {
+  if (!msg || typeof msg !== 'object') return;
   if (msg.action === 'syncNow') {
     reconcile('manual')
       .then(() => sendResponse({ ok: true }))

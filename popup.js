@@ -134,12 +134,18 @@ async function loadStatus() {
 
 // Welcome dismiss
 welcomeDismiss.addEventListener('click', async () => {
-  await chrome.storage.local.set({ welcomeDismissed: true });
-  welcome.style.display = 'none';
-  mainContent.style.display = 'block';
-  // Trigger first sync
-  await chrome.runtime.sendMessage({ action: 'syncNow' });
-  await loadStatus();
+  try {
+    await chrome.storage.local.set({ welcomeDismissed: true });
+    welcome.style.display = 'none';
+    mainContent.style.display = 'block';
+    // Trigger first sync
+    await chrome.runtime.sendMessage({ action: 'syncNow' });
+    await loadStatus();
+  } catch (err) {
+    console.error('Welcome dismiss error:', err);
+    statusText.textContent = 'Sync failed — try reopening popup';
+    statusDot.className = 'dot error';
+  }
 });
 
 // Sync Now
@@ -149,6 +155,10 @@ syncBtn.addEventListener('click', async () => {
   try {
     await chrome.runtime.sendMessage({ action: 'syncNow' });
     await loadStatus();
+  } catch (err) {
+    console.error('Sync button error:', err);
+    statusText.textContent = 'Sync failed — try reopening popup';
+    statusDot.className = 'dot error';
   } finally {
     syncBtn.disabled = false;
     syncBtn.textContent = 'Sync Now';
@@ -173,6 +183,10 @@ resetYes.addEventListener('click', async () => {
     resetConfirm.style.display = 'none';
     resetBtn.style.display = '';
     await loadStatus();
+  } catch (err) {
+    console.error('Reset error:', err);
+    statusText.textContent = 'Reset failed — try reopening popup';
+    statusDot.className = 'dot error';
   } finally {
     resetYes.disabled = false;
   }
