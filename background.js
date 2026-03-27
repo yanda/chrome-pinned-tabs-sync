@@ -337,29 +337,42 @@ async function reconcile(trigger) {
       }
     }
 
-    // 11. Reorder pinned tabs to match desired order
-    //     Build the desired order, then only move tabs that are out of place.
-    //     Re-query once after all creates/unpins, then move left-to-right.
-    const orderedUrls = [...desiredUrls].sort(
-      (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
-    );
-
-    let reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
-    let needsRequery = false;
-    for (let i = 0; i < orderedUrls.length; i++) {
-      const url = orderedUrls[i];
-      // Re-query only if a previous move shifted indices
-      if (needsRequery) {
-        reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
-        needsRequery = false;
+    // 11. Reorder: either push local order to remote, or pull remote order to local.
+    //     On local triggers (tab-moved, pin-change), adopt local tab positions as the
+    //     source of truth for order. On remote triggers (sync-change, startup, periodic,
+    //     install), reorder local tabs to match remote order.
+    const localOrderTriggers = new Set(['tab-moved', 'pin-change', 'pinned-url-change']);
+    if (localOrderTriggers.has(trigger)) {
+      // Push local positions into remote order values
+      const currentPinnedTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+      for (const tab of currentPinnedTabs) {
+        const url = normalizeUrl(tab.url);
+        if (remotePinned[url]) {
+          remotePinned[url].order = tab.index;
+        }
       }
-      const tab = reorderTabs.find(t => normalizeUrl(t.url) === url);
-      if (tab && tab.index !== i) {
-        try {
-          await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
-          needsRequery = true;
-        } catch (err) {
-          console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
+    } else {
+      // Pull remote order to local: move tabs to match desired order
+      const orderedUrls = [...desiredUrls].sort(
+        (a, b) => (remotePinned[a].order || 0) - (remotePinned[b].order || 0)
+      );
+
+      let reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+      let needsRequery = false;
+      for (let i = 0; i < orderedUrls.length; i++) {
+        const url = orderedUrls[i];
+        if (needsRequery) {
+          reorderTabs = await chrome.tabs.query({ pinned: true, windowId: mainWindowId });
+          needsRequery = false;
+        }
+        const tab = reorderTabs.find(t => normalizeUrl(t.url) === url);
+        if (tab && tab.index !== i) {
+          try {
+            await safeTabOp(() => chrome.tabs.move(tab.id, { index: i }));
+            needsRequery = true;
+          } catch (err) {
+            console.error(LOG_PREFIX, 'Failed to reorder tab:', url, err);
+          }
         }
       }
     }
@@ -447,8 +460,13 @@ function onStartup() {
 
 function onStorageChanged(changes, areaName) {
   if (areaName !== 'sync') return;
-  if (isSyncing) return;
   if (changes.pinnedTabs || changes.tombstones) {
+    if (isSyncing) {
+      // Queue so the change is picked up after current reconcile finishes
+      console.log(LOG_PREFIX, 'Sync storage changed while syncing, queuing');
+      pendingReconcileTrigger = 'sync-change';
+      return;
+    }
     console.log(LOG_PREFIX, 'Sync storage changed externally');
     scheduleReconcile('sync-change');
   }
@@ -483,7 +501,9 @@ function onTabRemoved(tabId, removeInfo) {
 }
 
 function onTabMoved(tabId, moveInfo) {
-  // Sync reorder when user manually moves a pinned tab
+  // Sync reorder when user manually moves a pinned tab.
+  // We update remote order values from current local positions
+  // rather than re-imposing the old remote order.
   if (knownPinnedTabIds.has(tabId)) {
     scheduleReconcile('tab-moved');
   }
@@ -497,7 +517,12 @@ function onAlarm(alarm) {
 
 function onMessage(msg, sender, sendResponse) {
   if (msg.action === 'syncNow') {
-    reconcile('manual').then(() => sendResponse({ ok: true }));
+    reconcile('manual')
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => {
+        console.error(LOG_PREFIX, 'Manual sync failed:', err);
+        sendResponse({ ok: false, error: err.message });
+      });
     return true;
   }
   if (msg.action === 'getStatus') {
@@ -506,6 +531,9 @@ function onMessage(msg, sender, sendResponse) {
       chrome.storage.local.get(['localSnapshot'])
     ]).then(([syncData, localData]) => {
       sendResponse({ ...syncData, localSnapshot: localData.localSnapshot });
+    }).catch(err => {
+      console.error(LOG_PREFIX, 'getStatus failed:', err);
+      sendResponse({ pinnedTabs: {}, tombstones: {}, meta: {} });
     });
     return true;
   }

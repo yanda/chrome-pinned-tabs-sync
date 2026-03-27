@@ -34,6 +34,7 @@ function formatUrl(url) {
 
 function timeAgo(timestamp) {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (seconds < 0) return 'just now'; // clock skew — treat future timestamps as now
   if (seconds < 60) return 'just now';
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
@@ -46,6 +47,11 @@ function timeAgo(timestamp) {
 async function loadStatus() {
   try {
     const data = await chrome.runtime.sendMessage({ action: 'getStatus' });
+    if (!data || typeof data !== 'object') {
+      statusText.textContent = 'Waiting for service worker...';
+      statusDot.className = 'dot stale';
+      return;
+    }
     const pinnedTabs = data.pinnedTabs || {};
     const tombstones = data.tombstones || {};
     const meta = data.meta || {};
