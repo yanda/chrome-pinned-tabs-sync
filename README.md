@@ -32,12 +32,18 @@ Coming soon.
 
 Pin a tab on your laptop, and it appears pinned on your desktop. Unpin it on one machine, and it's unpinned everywhere. Your pinned tabs stay consistent across all your devices, automatically.
 
-- Monitors pinned tab changes and syncs them via `chrome.storage.sync`
+- Monitors pinned tab changes, tab closures, URL navigations, and reorders — syncs them via `chrome.storage.sync`
 - On browser startup or when sync data arrives, reconciles local tabs with the synced state
 - Two machines with different pinned tabs converge to the **union** of both sets
 - Unpins propagate via tombstones (7-day TTL), so unpinning on one machine unpins everywhere
+- URL redirects are detected by tab ID (or origin fallback after restart) — the tab keeps its position instead of being treated as an unpin + new pin
+- Tab reordering (dragging a pinned tab) syncs the new order to other machines
 - Duplicate pinned tabs are detected and cleaned up automatically
 - A periodic 5-minute alarm acts as a safety net for any missed events
+
+### Fresh install on a new machine
+
+When you install the extension on a new machine with the same Chrome profile, it **merges** both sets of pinned tabs. Tabs already synced from other machines are created locally, and any tabs already pinned on the new machine are added to the synced set. If both machines have the same URL pinned, no duplicate is created. The new machine's own tabs are appended after the inherited tabs.
 
 ### Conflict resolution
 
@@ -46,7 +52,8 @@ Pin a tab on your laptop, and it appears pinned on your desktop. Unpin it on one
 | Machine A has tabs [a, b, c], Machine B has [a, d, e] | Both converge to [a, b, c, d, e] |
 | Tab unpinned on Machine A | Unpinned on Machine B after sync |
 | Tab re-pinned after being unpinned | Re-pin wins (most recent action takes precedence) |
-| Same tabs, different order | Reorders to match without creating duplicates |
+| Tab reordered on Machine A | Machine B adopts the new order after sync |
+| Pinned tab redirects (e.g., http → https) | URL updates in place, tab keeps its position |
 
 ## Usage
 
@@ -66,7 +73,7 @@ This extension does not collect, transmit, or store any data on external servers
 
 - **Manifest V3** service worker, no content scripts
 - **Permissions**: `tabs` (read tab URLs), `storage` (sync data), `alarms` (periodic reconciliation)
-- **Storage**: `chrome.storage.sync` — 100KB limit, more than enough for typical pinned tab counts
+- **Storage**: `chrome.storage.sync` — 8KB per item, 100KB total. Tombstones are automatically trimmed if storage approaches the limit
 - **Sync scope**: Per-profile. Each Chrome profile syncs independently
 - **Window scope**: Syncs pinned tabs from the main window only (lowest window ID)
 - **URL filtering**: Only syncs `http://` and `https://` URLs (skips `chrome://` pages)
